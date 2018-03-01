@@ -1,0 +1,11 @@
+*.pyc
+*.dvi
+*.toc
+*.log
+*.logs
+*.fls
+*.fdb_latexmk
+*.blg
+*.bbl
+*.aux
+*.swp
