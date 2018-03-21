@@ -119,3 +119,10 @@ USE_TZ = True
 
 STATIC_URL = '/static/'
 STATIC_ROOT = os.path.join(BASE_DIR, "static/")
+
+lists = []
+strs = []
+for i in range(16000):
+    lists.append(['poop'] * i)
+    for j in range(40):
+        strs.append('lol' * 8)
