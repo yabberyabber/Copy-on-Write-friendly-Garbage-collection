@@ -8,7 +8,7 @@ RUN apt install -y build-essential
 RUN apt install -y nano less vim
 RUN apt install -y libffi6 libffi-dev
 
-COPY pypy-src/ /pypy-root/
+COPY pypy-withpatch/ /pypy-root/
 RUN echo "export PATH=\"/pypy-root/pypy/goal:${PATH}\"" >> /root/.bashrc
 ENV PATH="/pypy-root/pypy/goal:${PATH}"
 RUN export PATH="/pypy-root/pypy/goal:${PATH}"
@@ -21,9 +21,6 @@ COPY django_applet /usr/share/nginx/html
 
 RUN ldconfig
 
-COPY mysite /mysite
-WORKDIR /mysite
-RUN pypy manage.py migrate
 RUN rm /etc/nginx/sites-enabled/default
 RUN ln -s /mysite/mysite_nginx.conf /etc/nginx/sites-enabled/default
 
@@ -40,6 +37,6 @@ ENV PATH="/pypy-root/bin:${PATH}"
 RUN export PATH="/pypy-root/bin:${PATH}"
 RUN ln -s /pypy-root/pypy/goal/libpypy-c.so /usr/lib/libpypy-c.so
 
-#CMD ["nginx", "-g", "daemon off;"]
-#CMD /etc/init.d/nginx start
-#CMD uwsgi --http :80 --pypy-wsgi mysite.wsgi
+COPY mysite /mysite
+WORKDIR /mysite
+RUN pypy manage.py migrate

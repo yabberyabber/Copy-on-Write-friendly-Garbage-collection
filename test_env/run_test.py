@@ -5,6 +5,7 @@ from httperfpy import Httperf, HttperfParser
 import matplotlib.pyplot as plt
 import json
 from threading import Thread
+import sys
 
 measurements = defaultdict(lambda: {})
 num_requests = 0
@@ -63,7 +64,7 @@ def test_load(requests=30):
     a.join()
     b.join()
 
-def plot_results():
+def plot_results(measurements):
     fig, (shared, private) = plt.subplots(2, 1)
 
     Xs = []
@@ -79,24 +80,29 @@ def plot_results():
     shared.set_xlabel("num_requests")
     shared.set_ylabel("memory (kb)")
     shared.set_title("Shared memory")
+    shared.set_xlim(left=0)
 
     private.scatter(Xs, private_Ys)
     private.set_xlabel("num_requests")
     private.set_ylabel("memory (kb)")
     private.set_title("Nonshared memory")
+    private.set_xlim(left=0)
+    private.set_ylim(bottom=0)
 
     fig.tight_layout()
     plt.show()
 
-for _ in range(30):
+if __name__ == '__main__':
+    print sys.argv[1]
+    for _ in range(60):
+        measure_all_pids()
+        test_load()
+        print _
+
     measure_all_pids()
-    test_load()
-    print _
+    pprint(dict(measurements))
 
-measure_all_pids()
-pprint(dict(measurements))
+    with open(sys.argv[1], 'w') as outfile:
+        json.dump(measurements, outfile)
 
-with open('results.json', 'w') as outfile:
-    json.dump(measurements, outfile)
-
-plot_results()
+    plot_results(measurements)
