@@ -1,14 +1,19 @@
 \documentclass{article}
 \usepackage[utf8]{inputenc}
 \usepackage[margin=1in]{geometry} 
+\usepackage{listings}
 
-%\usepackage{titlesec}
+\usepackage{color}
+ 
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
 
-%\titleformat*{\section}{\normalsize\bfseries}
-%\titleformat*{\subsection}{\normalsize\bfseries}
-%\titleformat*{\subsubsection}{\normalsize\bfseries}
-%\titleformat*{\paragraph}{\normalsize\bfseries}
-%\titleformat*{\subparagraph}{\normalsize\bfseries}
+\usepackage{fontspec}
+\usepackage{pgfplots}
+\newlength\figurewidth
+\newlength\figureheight
 
 \pretolerance=10000
 
@@ -22,7 +27,7 @@
     \maketitle
 
     \begin{abstract}
-        Most research into garbage collection is focused on analyzing a single process in isolation.  This paper focuses on the garbage collection of many processes with shared memory.  We examine a deployment of a Django webserver (written in python) running in multi process mode and profile its memory usage with various garbage collection algorithms.  We then modify pypy's generational garbage collector to improve its use of copy-on-write memory.  Specifically, we make references between objects into indirect references and store those in densely packed reference tables.  That way when an object is relocated from a younger into an older generation, only the reference table needs to be updated to reflect the object's new location.  This prevents the garbage collector from unnecessarily writing to shared memory.  
+        Most research into Garbage Collection is focused on analyzing a single process in isolation.  This paper focuses on the Garbage Collection of many processes with shared memory.  We examine a deployment of a Django webserver (written in Python) running with multiple forked workers and profile its memory usage with various Garbage Collection strategies.  We use PyPy, a Python runtime environment with a modular codebase, and modify the Garbage Collector to improve its use of copy-on-write memory. Specifically, we take Garbage Collector state which was previously stored inside the objects and instead store that state in separate memory pages.  That way when a collection event occurs, those pages which were shared between Python processes can remain untouched during collection.  Our analysis found that the modification incurs some runtime overhead which initially increases page load latency but that it also decreases memory usage in worker processes by up to 20\% and preserves shared memory between workers.  
     \end{abstract}
 \end{titlepage}
 
@@ -36,15 +41,19 @@
 
 
 \section{Introduction}
-Advances in interpretors for high level languages have enabled the use of high level languages in performance critical applications.  Some of the most visited websites on the Internet as of 2018 are written in high level languages such as Python, Ruby, and PHP.  A common problem with these deployments is memory usage: garbage collected languages tend to use more memory than their manually-memory-managed counterparts. In order for these popular websites to continue to scale up, the tools on which they are developed need to get more efficient.  Webservers need to use less memory.
+Advances in interpretors for high level languages have enabled their use in performance critical applications.  Some of the most visited websites on the Internet as of 2018 are written in high level languages such as Python, Ruby, and PHP.  A common problem with these deployments is memory usage: Garbage Collected languages tend to use more memory than their manually-memory-managed counterparts. In order for these popular websites to continue to scale up, the tools on which they are developed need to get more efficient.  Many of these systems are memory bound and so in order to make them more efficient we must make them use less memory.  
 
-Most research into garbage collection focuses on the process in isolation.  This paper, however, examines garbage collection in a group of processes which share memory in a Copy-On-Write fashion.  In a webserver environment where worker processes are often forked repeatedly during operation, this situation is very common.  Workers forked from the master process initially share some memory with the master and so the memory usage of the system as a whole is directly related to how much memory can be shared between processes.  This is the type of environment that many of today's largest websites like Instagram\cite{dismissing_garbage} operate with and so we believe that improvements made in this area can be used to improve performance in the field as a whole.
+Most research into Garbage Collection focuses on the process in isolation.  This paper, however, examines Garbage Collection in a group of processes which share memory in a Copy-On-Write fashion.  In a webserver environment where worker processes are often forked repeatedly during operation, this situation is very common.  Workers forked from the master process initially share some memory with the master and so the memory usage of the system as a whole is directly related to how much memory can be shared between processes.  This is the type of environment that many of today's largest websites like Instagram operate with\cite{dismissing_garbage}.
 
-To accomplish this goal, this paper examines an optimization in PyPy's Generational Garbage Collector which is designed to reduce the number of shared pages that get dirtied during the copying phase of a minor collection.  Section \ref{sec:background} explains various topics relating to the optimization and builds up to a demonstration intended to create some intuition into how this optimziation is designed to work.  Section \ref{sec:design} explains the nitty gritty details of the optimization and builds intuition as to which data structures need to be changed.  Section \ref{sec:implementation} summarizes the source changes made to PyPy's garbage collector in order to implement this.  Section \ref{sec:method} talks about how these changes were tested and section \ref{sec:analysis} examines the results of these tests and explains them.  Finally, section \ref{sec:relatedwork} talks about other optimizations that have been made to Garbage Collectors to optimize for Copy-On-write behavior and explains how they differ from this research.  
+Oftentimes in environments like this, the Garbage Collector will disturb shared pages during collection.  While Garbage Collection has the intention of reducing the number of pages used by a process, by disturbing shared pages in forked workers, the Garbage Collector ends up increasing memory usage in the group as a whole \cite{dismissing_garbage}.  
+
+This paper examines an optimization in PyPy's Generational Garbage Collector\cite{pypy-doc} which is designed to reduce the number of shared pages that get dirtied during a major collection.  To accomplish this, we take Garbage Collector state which was previous stored within each object and we move that state into a dense index stored in its own page in memory.  This prevents the Garbage Collector from needing to write to shared memory during collection.  
+
+Section \ref{sec:background} explains various topics relating to the optimization and builds up to a demonstration intended to create some intuition into how this optimization is designed to work.  Section \ref{sec:design} explains the nitty gritty details of the optimization and builds intuition as to which data structures need to be changed.  Section \ref{sec:implementation} summarizes the source changes made to PyPy's Garbage Collector in order to implement this.  Section \ref{sec:method} talks about how these changes were tested and section \ref{sec:analysis} examines the results of these tests and explains them.  Finally, section \ref{sec:relatedwork} talks about other optimizations that have been made to Garbage Collectors to optimize for Copy-On-write behavior and explains how they differ from this research.  
 
 \section{Background}\label{sec:background}
 
-This section provides some background information that may help to contextualize the methods used in this paper.  Section \ref{sec:CoW} is a quick review of the Linux memory model as well as an explanation of Copy-on-Write semantics.  Sections \ref{sec:RCGC} and \ref{sec:MSGC} are a quick review of the Reference-Counting and Mark-and-Sweep algorithms used together in CPython's Garbage Collector.  Section \ref{sec:CGGC} is an overview of the Compacting Generational Garbage Collection algorithm used in PyPy and racket.  Finally, section \ref{sec:CoWGC} is an overview of how these algorithms can work against each other to increase memory used by a collection of related processes.  Those familiar with the algorithms covered in sections \ref{sec:CoW}, \ref{sec:MSGC}, and \ref{sec:CGGC} may wish to skip over those sections.  Section \ref{sec:CoWGC} is more than simple review and thus should not be skipped.  
+Before presenting the modifications made to PyPy's Garbage Collector, we first motivate the need for Copy-on-Write-Sensitive Garbage Collection by explaining how shared memory gets wasted.  First we review the Linux memory model and Copy-on-Write semantics.  Next we review Reference Counting Garbage Collection as well as Mark-and-Sweep Garbage Collection and Compacting Generational Garbage Collection.  Finally we put this information together to demonstrate how these algorithms when used in conjunction can end up unnecessarily wasting memory in a shared-memory environment.  
 
 \subsection{Copy-on-Write (CoW) semantics}\label{sec:CoW}
 
@@ -52,122 +61,202 @@ When a process in Linux forks, a new process is spawned with an identical addres
 
 When either the parent or the child process attempt to write to a shared page in memory, a minor page fault occurs.  Control is shifted to the kernel which determines how to proceed.  If the physical page is still being shared, the kernel allocates a new physical page, copies the contents of the shared page into the new physical page, decrements the reference count in the shared page, and inserts the new physical page into the faulted process's page table \cite{VMM}.  If the physical page is no longer being shared (for example if the child process already wrote to the physical page in question and made their own copy) then the page is converted from a read-only shared page to a read-write private page \cite{VMM}.  In this way, memory is allocated and the process's page-table is updated in an extremely lazy manor which has proven to be very efficient in practice.  
 
-In the event that a process forks multiple times, the same mechanism still works.  A single address space can be shared among $N$ processes.  Since each page has an unsigned int dedicated to reference count, quite a few pages can refer to a single page and copying will happen as needed \cite{kernelsource,VMM}.  
+In the event that a process forks multiple times, the same mechanism still works.  A single address space can be shared among $N$ processes.  Since each page has an entire word dedicated to reference count, quite a few pages can refer to a single page and copying will happen as needed \cite{kernelsource,VMM}.  
 
 \subsection{Reference-Counting Garbage Collection (RCGC)}\label{sec:RCGC}
 
-Under a Reference-Counting Garbage Collection regime, every object has an internal reference count attribute.  When new references to this object are created, the reference count attribute is incremented.  When references to this object are updated or when objects which refer to this object are collected, the reference count attribute is decremented.  When the reference count of an attribute reaches zero, it is garbage collected and all the objects to which it refers are visited accordingly \cite{GC-continuum}.  
+Under a Reference-Counting Garbage Collection regime, every object has an internal reference count attribute.  When new references to this object are created, the reference count attribute is incremented.  When references to this object are updated or when objects which refer to this object are collected, the reference count attribute is decremented.  When the reference count of an attribute reaches zero, it is Garbage Collected  and the object is deleted in place.  When an object is collected, all the objects that it referred to are updated visited accordingly \cite{GC-continuum}.  
 
-This garbage collection algorithm can be visualized as a directed graph where every node is an object in memory and where every edge is a reference from one object to another.  The reference count for each object is the the in-degree of its associated node.  When there are no edges into a node, the algorithm knows that that node (and all its out-edges) can be collected.  This scheme has advantages in that many objects can be collected as soon as they become unreachable.  However, if a group of unreachable objects form a reference cycle, their reference counts will never reach zero and so they will never be collected by a strictly reference-counted system.  
+This Garbage Collection algorithm can be visualized as a directed graph where every node is an object in memory and where every edge is a reference from one object to another.  The reference count for each object is the in-degree of its associated node.  When there are no edges into a node, the algorithm knows that this node (and all its out-edges) can be collected.  This scheme has advantages in that many objects can be collected as soon as they become unreachable.  However, if a group of unreachable objects form a reference cycle, their reference counts will never reach zero and so they will never be collected by a strictly reference-counted system.  Additionally, because objects are collected in place, this collection strategy is subject to fragmentation over time \cite{GC-continuum}.  
 
-This algorithm has been used extensively in CPython since python 2 and accounts for the majority of object collection in most running systems \cite{cpython3-doc}.  Whenever a reference is created, updated, or deleted, CPython visits the objects being referenced and updates their reference counts appropriately.  To account for cycles in the object graph, CPython does occasional collections using the Mark-And-Sweep algorithm.  
+This algorithm has been used extensively in CPython since Python2 and accounts for the majority of object collection in most running systems \cite{cpython3-doc}.  Whenever a reference is created, updated, or deleted, CPython visits the objects being referenced and updates their reference counts appropriately.  To account for cycles in the object graph, CPython does occasional collections using the Mark-And-Sweep algorithm.  
 
 \subsection{Mark-And-Sweep Garbage Collection (MSGC)}\label{sec:MSGC}
 
-Mark-and-Sweep Garbage Collection can be modeled as a traversal of the object graph starting with a set of "accessible roots".  These accessible roots are objects that are being directly referenced by the program (e.g. globals, variables on the stack, intermediate values of a computation, etc.).  Starting with these nodes, the algorithm recursively visits adjacent nodes marking them as "accessible" when they are visited.  At the end of this first sweep, the algorithm has divided all objects into two sets: those which are accessible to the program (nodes tags as "accessible") and those which are not accessible to the program (nodes not tagged as "accessible").  To do the collection, the algorithm makes a pass over every object in the system.  Those not tagged as "accessible" are deleted in place \cite{GC-continuum}. 
+Mark-and-Sweep Garbage Collection can be modeled as a traversal of the object graph starting with a set of ``accessible roots''.  These accessible roots are objects that are being directly referenced by the program (e.g. globals, variables on the stack, intermediate values of a computation, etc.).  Starting with these nodes, the algorithm recursively visits adjacent nodes marking them as ``accessible'' when they are visited.  At the end of this first sweep, the algorithm has divided all objects into two sets: those which are accessible to the program (nodes tagged as ``accessible'') and those which are not accessible to the program (nodes not tagged as ``accessible'').  To do the collection, the algorithm makes a pass over every object in the system.  Those not tagged as ``accessible'' are deleted in place \cite{GC-continuum}. 
 
-A common problem with this algorithm is that objects are deleted in-place and so the physical memory where objects reside tends to become fragmented over time.  This increases the number of physical pages in use and increases the cache miss rate.  
+A common problem with this algorithm is that objects are deleted in-place and so the physical memory where objects reside tends to become fragmented over time.  This increases the number of physical pages in use and increases the cache miss rate.  Additionally, because a complete Mark-and-Sweep collection needs to traverse the entire object-graph, there is a significant pause while collection occurs \cite{GC-continuum}.  
 
-This algorithm has been used in conjunction with Reference Counting in CPython since python 2.  While the reference counter is always running in the background during CPython execution, CPython will initiate a MSGC (usually called a "major collection event") collection once memory usage exceeds a certain threshold.  In combination, these algorithms eliminate most garbage in a timely manor while also correctly collecting cycles that form on occasion \cite{cpython3-doc}.  
+This algorithm has been used in conjunction with Reference Counting in CPython since Python2.  While the reference counter is always running in the background during CPython execution, CPython will initiate a MSGC (usually called a ``major collection event'') collection once memory usage exceeds a certain threshold.  In combination, these algorithms eliminate most garbage in a timely manor while also correctly collecting cycles that form on occasion \cite{cpython3-doc}.  
 
 \subsection{Compacting Generational Garbage Collection (CGGC)}\label{sec:CGGC}
 
-In Compacting Generational Garbage Collection, objects are divided into multiple "generations" which are each located on separate physical pages of memory.  In many cases there are 3 or 4 successively larger generations.  New objects are inserted into generation 0 (often called the "nursery").  Once generation 0 reaches a certain size, the objects in generation 0 are traversed starting with the accessible roots.  Objects in generation 0 which are still accessible are copied to generation 1.  When all the accessible objects in generation 0 have been relocated, generation 0 is cleared \cite{GC-continuum}.  
+In Compacting Generational Garbage Collection, objects are divided into multiple ``generations'' which are each located on separate physical pages of memory.  In many cases there are 3 or 4 successively larger generations.  New objects are inserted into generation 0 (often called the ``nursery'').  Once generation 0 reaches a certain size, the objects in generation 0 are traversed starting with the accessible roots.  Objects in generation 0 which are still accessible are copied to generation 1.  When all the accessible objects in generation 0 have been relocated, generation 0 is cleared \cite{GC-continuum}.  
 
 When generation 1 gets larger than some threshold, it is collected in the same way and accessible objects are copied to generation 2.  Indeed when generation $N$ gets large enough, its contents are traversed, accessible objects are copied to generation $N+1$, and generation $N$ is cleared.
 
-In most implementations there is a final generation (often called the "mature" generation) for objects that have survived all the prior collections.  There are several ways to handle this final generation - the most common being to let the garbage build up.  This implementation is not technically correct but it performs well in practice.  In PyPy, the mature generation is collected using the MSGC.  Memory fragmentation which may occur in PyPy's mature generation are possible filled when objects are copied from younger generations into mature \cite{pypy-doc}.  
+In order to correctly account for inter-generational references, each generation must keep track of references from other generations into itself.  When an object in generation $M$ is updated to reference an object in generation $N$, that object is added to generation $N$'s cross-reference list.  When generation $N$ is collected, the Garbage Collector adds references in the cross-reference list to the root accessible set and those references are used when tracing which objects are in use.  When an object in generation $M$ is copied to generation $M + 1$, all the updates to that object must be updated to refer to this new location in memory \cite{GC-continuum}.  
 
-\begin{quotation}
-    "Many generational GC's are not comprehensive--they don't successfully remove all the garbage (long-lived garbage, in particular, may never get collected). But it's the fresh garbage that smells the worst. :)"
+In most implementations there is a final generation (often called the ``mature'' generation) for objects that have survived all the prior collections.  There are several ways to handle this final generation - the most common being to simply never collect it.  This implementation is not technically correct but it performs well in practice.  
 
-    -- C2 Wiki\cite{C2}
-\end{quotation}
-
-\subsubsection{Inter-Generational References: Always Use Protection!}
-
-The CGGC algorithm as described above is incomplete.  It's possible for objects in one generation to refer to objects in another generation and doing a naive "accessible-roots" seeded traversal will not see these references which may cause some objects to get collected prematurely.  To prevent this we introduce a protective write barrier.  
-
-Every generation keeps a list of cross-generational references into that generation.  When an object in generation $M$ is updated to reference an object in generation $N$, that object is added to generation $N$'s cross-reference list.  When generation $N$ is collected, the garbage collector adds references in the cross-reference list to the root accessible set and those references are used when tracing which objects are in use.  When an object in generation $M$ is copied to generation $M + 1$, all the updates to that object must be updated to refer to this new location in memory \cite{GC-continuum}.  
+The PyPy Python environment uses CGGC with two generations: a ``nursery generation'' for young objects and a ``mature generation'' for mature objets.  On occasion, the mature generation is collected using the MSGC.  Memory fragmentation in the mature generation can be filled when objects are copied from younger generations into mature \cite{pypy-doc}.  
 
 \subsection{Tragedy of the commons: Dirtying Shared Pages in CGGC}\label{sec:CoWGC}
 
-Each of these algorithms alone serve to minimize the memory used by an individual process as it runs.  CoW allows related processes to share physical memory, and all three garbage collection algorithms reduce the number of physical pages needed by each process.  However, when used in conjunction we often see that the memory performance of a collection of related processes suffers.
+Each of these algorithms alone serve to minimize the memory used by an individual process as it runs.  CoW allows related processes to share physical memory, and all three Garbage Collection algorithms reduce the number of physical pages needed by each process.  However, when used in conjunction we often see that the memory performance of a collection of related processes suffers \cite{dismissing_garbage}.
 
 As a thought experiment, consider a forking webserver written in python running atop a standard CPython interpretor.  When a request comes in, the process forks to spawn a worker thread which begins processing the request.  The parent process has much in memory the child process can reference during its computation.  
 
-As the child process continues, it will surely create or update a reference to some existing constant data structure.  When this happens, the reference count field in the referenced object must be updated.  This triggers a copy-on-write because even though none of of the objects stored on the page changed, the meta-data that the garbage collector stores on the page has changed.  In this way, reference counting breaks shared pages which can increase memory used by the system.
+As the child process continues, it will surely create or update a reference to some existing constant data structure.  When this happens, the reference count field in the referenced object must be updated.  This triggers a copy-on-write because even though none of of the objects stored on the page changed, the meta-data that the Garbage Collector stores on the page has changed.  In this way, reference counting breaks shared pages which can increase memory used by the system.
 
-When a CPython major collection event occurs, the MSGC algorithm will start a full heap traversal that marks objects as "accessible" or "not-accessible".  Because the garbage collector stores this information adjacent to the objects in memory, the shared pages containing these objects get written to which triggers a copy-on-write and the page sharing breaks.  In this way, a single major garbage collection event can greatly increase memory used by the system.
+When a CPython major collection event occurs, the MSGC algorithm will start a full heap traversal that marks objects as ``accessible'' or ``not-accessible''.  Because the Garbage Collector stores this information adjacent to the objects in memory, the shared pages containing these objects get written to which triggers a copy-on-write and the page sharing breaks.  In this way, a single major Garbage Collection event can greatly increase memory used by the system.
 
-This problem is somewhat alleviated when using a generational garbage collector such as is included in PyPy because we can copy objects out of a shared page without writing to it, however when we do the copy, those inter-generational references must be updated.  Doing a minor collection of generation 1 may force writes to generations 2, 3, 4, etc, which breaks the sharing of those pages.  
+This problem is somewhat alleviated when using CGGC such as is included in PyPy because we can copy objects out of a shared page without writing to it, however PyPy's GC is also subject to the dirtying of pages that happens when the mature generation is Mark-and-Swept.  
 
 While these algorithms are successful at reducing the memory usage of an individual process, when examining a collection or related processes they do poorly at reducing total combined memory usage.  The next section is dedicated to modifying CGGC to solve this problem.  
 
 \section{Design}\label{sec:design}
 
-The default garbage collector in PyPy is called "minimark" and it is a classic Generational Garbage Collector with 2 generations \cite{pypy-doc}.  New objects are created in the nursery and are moved to gen1 on minor collection events.  
+In this paper we modify the Garbage Collector in the PyPy Python runtime environment.  We choose PyPy because it is written in a dialect of Python which makes the interpreter easy to modify for experimental purposes.  Also, because PyPy's Garbage Collector is a relatively simple CGGC, the modification and analysis is relatively straightforward.  
 
-\begin{enumerate}
-    \item Currently when mature objects refer to old objects, that reference is stored in a special "write barrier" so their references are counted
-    \item When young object moves from young to mature generation, the objects which refer to it get updated in-place
-    \item We are going to put all references between objects in a reference table... every lookup will be a double lookup but every update will be a single edit to the table
-\end{enumerate}
+To prevent the Garbage Collector from touching objects in place, we add a hashtable to the Garbage Collector that contains the set of all the elements that have been visited.  When a Mark-and-Sweep occurs in the mature generation, rather than writing to the objects in place, the Garbage Collector inserts the object's id into the hashtable.  When the Mark-and-Sweep finishes, that hashtable is cleared.  
 
 \section{Implementation}\label{sec:implementation}
-\begin{enumerate}
-    \item Give a summary of which structures and functions actually changed
-    \item Where did I store this information?  How is it accessed in code?  
-    \item maybe some pseudocode snippets
-\end{enumerate}
+
+PyPy has several Garbage Collectors but the one we chose to patch for the purposes of this paper is called ``minimark''.  Minimark is a CGGC with two generations \cite{pypy-doc}.  New objects are created in the ``nursery'' and are moved to the ``mature'' generation on minor collection events.  When the mature generation exceeds a certain size, a major collection starts and the mature generation is Mark-and-Swept.  During this MSGC, each object in the mature generation is visited and a bit is set in-place which tags that object as ``safe'' during this collection.  
+
+To implement this change, we added a member variable to the MiniMarkGC class of type $rpython.memory.support.AddressDict$.  PyPy's memory library does not provide an AddressSet type so this was chosen as an approximation.  Objects which are in the mapping and which map to themselves are considered visited and objects which either are not in the mapping or which map to NULL are considered unvisited.  
+
+The following code snippet was added to MiniMarkGC and demonstrates the new interface for determining an object's visited state.
+
+\begin{lstlisting}[language=python]
+def obj_visited(self, obj):
+  return (
+    self.visited_objs.contains(obj) and
+    self.visited_objs.get(obj) == obj)
+
+def mark_obj_visited(self, obj):
+  self.visited_objs.setitem(obj, obj)
+
+def unmark_obj_visited(self, obj):
+  self.visited_objs.setitem(obj,
+        llmemory.NULL)
+\end{lstlisting}
 
 \section{Methodologies}\label{sec:method}
+
+This paper focuses on a web-server workload and so to validate our patch, we chose to create the closest approximation of a production webserver possible.  Our model was Instagram's web-tier servers which are briefly described in their external blog.  Instagram is a massive Django instance running atop CPython2.7 using Ngnx as a front-end server and using uWSGI to manage Django worker processes \cite{dismissing_garbage}.  uWSGI is running in pre-fork mode meaning that a worker is started and then forked several times to create more workers.  When a worker dies, an existing worker is forked to replace it.  
+
+With this test environment we create 2 experimental groups.  The groups are as follows:
+
 \begin{enumerate}
-    \item Ngnx + uWSGI + Django + pypy in multi-process mode
-    \item Use thebluealliance.com as a test load because it caches a lot of data and does some non-trivial computation
-    \item Generate a bunch of fake traffic using httperf
-    \item Monitor running code
-        \begin{enumerate}
-            \item How long did it take to handle 10,000 requests
-            \item What was the average time-to-last-byte?
-            \item Total memory of all processes
-            \item Average memory of each process
-            \item shared memory per process
-            \item num page faults
-            \item cache miss rate?
-            \item pages served per second (did it go up or down?)
-            \item How many times did major and minor garbage collection happen?
-            \item How many times did this inter-generation optimization actually occur?
-        \end{enumerate}
+    \item Minimark GC without patch
+    \item Minimark GC with patch
 \end{enumerate}
+
+\subsection{Test Environment}
+
+In order to replicate this environment, we created a docker image that had Ngnx, uWSGI, Django, and PyPy installed on it.  We ran uWSGI in pre-fork mode with 4 worker processes.  The docker image was capped at 8GB of memory and 3 cpu cores.  All benchmarks were ron on a ThinkPad T460 with 12GB ram and an i5 2.4GHz quad-core processor.  Because the docker image was capped at well below the host's resource capacity, we believe benchmarks are reasonably isolated from resource contention with host processes.
+
+Because Instagram is closed-source, proprietary software, we were unable to procure its source code for use in testing.  Instead we created a Django application which was created specifically to emulate a production web-server load.  Specifically, we created a Django application which allocates a large chunk of memory at startup and which allocates an additional chunk of memory for each request.  Below are the snippets of code used to create test-garbage:
+
+\begin{lstlisting}[language=python]
+class LargeObject():
+  # Use a bunch of memory
+  def __init__(self):
+    self.lists = []
+    self.strs = []
+    for i in range(1600):
+      self.lists.append(['text'] * i)
+      for j in range(40):
+        self.strs.append('str' * 8)
+
+def on_startup():
+  global static_memory
+  static_memory = [
+    LargeObject()
+    for x
+    in range(5)]
+
+def on_page_load():
+  global glob_a, glob_b, glob_c
+  glob_a, glob_b, glob_c = (
+    LargeObject(), glob_a, glob_b)
+\end{lstlisting}
+
+We believe that this mix of memory allocation somewhat approximates what might be seen in a production web-server.  
+
+\subsection{Stress-Testing the Deployment}
+
+To generate a test load we used httperf which makes a series of http requests to a given http endpoint.  We chose to track two specific metrics for each experimental group: The time it took to handle $N$ requests and the memory used after handling $N$ requests.
+
+To determine the time to handle $N$ requests, we use the httperf tool to make $N$ requests and record the wall-time it took for all requests to get a response.  We run this experiment with $N$ values of 5k, 10k, 15k, and 20k.  
+
+To track memory usage as the number of requests increases, we make a burst of 100 requests and then check the memory usage of each uWSGI worker process.  We repeat this process until we've made 50 bursts of requests or 5000 requests in total.  At each step we check memory usage by scraping that process's $/proc/PID/smaps$ file.  The private memory used by that process is the sum of all lines starting with ``Private\_clean'' and ``Private\_dirty'' and the public memory used by that process is the sum of all lines starting with ``Public\_clean'' and ``Public\_dirty''.  
 
 \section{Analysis}\label{sec:analysis}
-\begin{enumerate}
-    \item Did we actually save any memory?  How much on average?  Were there any patterns?   
-    \item How often did old objects actually refer to young objects?  
-    \item How often did minor collection happen?  Major collection?
-    \item How much CPU overhead was there in following that extra pointer every time?  Can I even measure this?
-    \item How many pages did we serve per second?  Did it go up or down?
-\end{enumerate}
+
+Experimental results show that this approach was successful in preserving shared memory in each worker process.  During our verification step we measured two types of performance:  memory usage and latency.  In the first section here we see that the patched version of the minimark GC uses less memory overall than the Standard version by preserving shared memory.  In the second section here we see that the Standard version serves more requests per second up until a certain point after which it underperforms because of paging.  This implies that while there is significant runtime overhead in this optimization, the costs can be outweighed by the savings in memory.  
+
+\subsection{Memory Usage}
+
+Figures \ref{fig:patched_mem} and \ref{fig:standard_mem} clearly show that the patched version of the Garbage Collector preserves more shared memory than the unpatched version.  In the upper portion of each figure we see the shared memory for each case.  In the Standard GC group, we see that the amount of shared memory trails off as the number of requests grows because when each of the worker processes runs major Garbage Collection they taint many of the pages.  On the other hand, the shared memory chart for the Patched GC is almost entirely flat meaning that those shared pages are untouched and preserved.  In the lower chart we can see that after 5000 requests, the Patched worker processes take up somewhere in the realm of 800Mb of space per worker while the Standard worker processes take up 1000 to 1200Mb of space per worker.  This accounts for a reduction of around 20\%.
+
+\begin{figure}\label{fig:patched_mem}
+    \begin{center}\textbf{Memory Usage of Patched GC}\end{center}
+    \resizebox{0.5\textwidth}{!}{\input{patched_mem.pgf}}
+    \caption{Memory usage of patched Garbage Collector running 4 workers after $X$ requests.  The }
+\end{figure}
+
+\begin{figure}\label{fig:standard_mem}
+    \begin{center}\textbf{Memory Usage of Standard GC}\end{center}
+    \resizebox{0.5\textwidth}{!}{\input{standard_mem.pgf}}
+    \caption{Memory usage of standard Garbage Collector running 4 workers after $X$ requests}
+\end{figure}
+
+\subsection{Latency}
+
+The table below shows the time per request for our deployment with and without the optimization.  Figure \ref{fig:latency} shows the same information in a graphical format.  We can see that for a small amount of traffic, the standard minimark GC responses to more requests per second than our patched version.  However, once the number of requests per second exceeded around 13k, the total memory of the system exceeded the 8GB allotted and the deployment started paging aggressively.  On the other hand the patched GC continues to settles down for larger numbers of requests.  The upward trend in response rate is a result of PyPy's tracing JIT'er - over the course of a program's lifetime PyPy will compile commonly executed codepaths.  When the application is freshly started, PyPy interprets the source code and spends time compiling codepaths.  After the application has been running for a while, PyPy spends less time interpreting and compiling and more time executing native code \cite{pypy-doc}
+
+\begin{center}
+\begin{tabular}{| l || l | l |}
+    \hline
+     & \textbf{Standard} & \textbf{Patched} \\
+    \hline
+    5k Requests & 190.8 conn/sec & 67.9 conn/sec \\
+    10k Requests & 269.2 conn/sec & 148.7 conn/sec \\
+    15k Requests & 97.7 conn/sec & 188.8 conn/sec \\
+    20k Requests & 103.2 conn/sec & 190.9 conn/sec \\
+    \hline
+\end{tabular}
+\end{center}
+
+From this data we can see that there is time overhead in our optimization.  If we had allocated more than 8GB of memory to the test, the Standard GC process would likely not have paged and would have responded to more requests per second than the patched version.  However the patched version used less memory overall and thus did not spend any time paging.  
+
+\begin{figure}\label{fig:latency}
+    \resizebox{0.5\textwidth}{!}{\input{chart_latency.pgf}}
+    \caption{Request Rate for different Request Quantities.  Note Standard GC started paging after 10k requests}
+\end{figure}
 
 \section{Future Work}\label{sec:futurework}
-\begin{enumerate}
-    \item What other changes could I make to improve CoW performance?  Lemme think.
-\end{enumerate}
+
+While the optimization explored in this paper account for noticeably memory savings, there is much more that can be done in the future.
+
+In a CGGC like PyPy, when objects are copied from Eden into the mature generation, all the mature objects which pointed to the new object in Eden must be updated to refer to that objects new post-copy location.  This results in writes to mature objects that can be avoided.  If instead of updating the pointers to young objects in place in the old objects, there were a reference table so that all references from old to young objects were indirect, then when young objects were copied only the reference table would need to be updated.  This lets the mature objects remain untouched even when the object which they are referencing moves.  
+
+Additionally, the benchmark used in this paper was concocted specifically for testing purposes.  The results from using this benchmark may or may not accurately reflect the reality of real-world Django deployments.  Future work would likely take the findings in this paper and apply them to actual existing production websites.  Finding an open source website that runs on Django that is relatively easy to deploy would be paramount in bringing this research to real-world relevance.  
+
+Lastly it would be interesting to see how the preservation of shared memory effects the cache miss rate of the worker processes.  In theory, if the worker processes are sharing physical memory then a single line-item in the cache can be shared amongst worker processes.  Whether this happens in would be worth looking into.  
 
 \section{Related work}\label{sec:relatedwork}
 
-This paper is very much inspired by recent updates in CPython's and Ruby MRI's garbage collectors which were updated in 2017 and 2014 respectively.  
+This paper is very much inspired by recent updates in CPython's and Ruby MRI's Garbage Collectors which were updated in 2017 and 2014 respectively.  
 
 \subsection{Copy-On-Write optimization in Ruby MRI's MSGC}
-Ruby 2.0 contains an update to the GC that improved CoW performance.  Ruby's GC is a classic CGGC with a young generation and an old generation.  In the old algorithm, every object contained a "visited" bit that would note whether the object had visited by the tracer.  In the new GC algorithm, these "visited" bits are stored outside the objects being traced.  In this way, the objects themselves don't need to be updated during a GC event.  
 
-The optimization described in this paper is different in that we focus on preserving old objects when objects are copied from Eden into the older generation.  
+Ruby 2.0 contains a similar update to the GC that improved CoW performance.  Ruby's GC is a classic CGGC with a young generation and an old generation that is occasionally Mark-and-Swept.  In the old algorithm, every object contained a ``visited'' bit that would note whether the object had visited by the tracer.  In the new GC algorithm, these ``visited'' bits are stored outside the objects being traced.  In this way, the objects themselves don't need to be updated during a GC event.  
+
+The optimization described in this paper is very similar to this however we are specifically testing this optimization in the context of Python for a webserver workload.  
 
 \subsection{Copy-On-Write Friendly Garbage Collection in CPython at Instagram}
-A 2017 article from Instagram's Engineering series describes changes to CPython's garbage collector made at Instagram aimed at improving memory performance in their web-tier servers.  The experimentation section of this paper is heavily inspired by the test setup used at Instagram.
 
-The optimization implemented at Instagram was to have the programmer manually mark certain objects as "GC-Frozen".  Objects that are GC-Frozen are not touched by the garbage collector and so the data in and around them is not touched.  Because Instagram's specific use case involves a lot of static objects that are shared between processes, this worked effectively.  
+A 2017 article from Instagram's Engineering series describes changes to CPython's Garbage Collector made at Instagram aimed at improving memory performance in their web-tier servers.  The experimentation section of this paper is heavily inspired by the test setup used at Instagram.
+
+The optimization implemented at Instagram was to have the programmer manually mark certain objects as ``GC-Frozen''.  Objects that are GC-Frozen are not touched by the Garbage Collector and so the data in and around them is not touched.  Because Instagram's specific use case involves a lot of static objects that are shared between processes, this worked effectively.  
+
+\section{Conclusion}
+
+The results in this paper clearly show that by moving Garbage Collector state out of the objects and into isolated Garbage Collector memory, we can prevent unnecessary memory writes and we can preserve shared memory between forked processes.  While the changes described in this paper have some runtime overhead in terms of mapping objects in memory to their associated Garbage Collector state, we found that for our deployment the savings in memory far outweighed the runtime overhead of the change. 
 
 \newpage
 \onecolumn
