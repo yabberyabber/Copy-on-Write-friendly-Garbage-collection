@@ -120,9 +120,13 @@ USE_TZ = True
 STATIC_URL = '/static/'
 STATIC_ROOT = os.path.join(BASE_DIR, "static/")
 
-lists = []
-strs = []
-for i in range(16000):
-    lists.append(['poop'] * i)
-    for j in range(40):
-        strs.append('lol' * 8)
+class LargeObject():
+    def __init__(self):
+        self.lists = []
+        self.strs = []
+        for i in range(16000):
+            self.lists.append(['poop'] * i)
+            for j in range(40):
+                self.strs.append('lol' * 8)
+
+static_memory = [LargeObject() for x in range(5)]

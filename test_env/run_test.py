@@ -46,7 +46,7 @@ def measure_all_pids():
         except:
             print "Couldn't get measurement for {} at {}".format(pid, num_requests)
 
-def test_load(requests=30):
+def test_load(requests=50):
     global num_requests
     num_requests += requests * 2
 
@@ -94,7 +94,7 @@ def plot_results(measurements):
 
 if __name__ == '__main__':
     print sys.argv[1]
-    for _ in range(60):
+    for _ in range(50):
         measure_all_pids()
         test_load()
         print _
