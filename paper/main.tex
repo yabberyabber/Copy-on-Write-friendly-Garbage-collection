@@ -6,9 +6,23 @@
 \usepackage{color}
  
 \definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codered}{rgb}{0.6,0,0}
 \definecolor{codegray}{rgb}{0.5,0.5,0.5}
 \definecolor{codepurple}{rgb}{0.58,0,0.82}
 \definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+% Python style for highlighting
+\lstdefinestyle{pystyle}{
+    language=python,
+    otherkeywords={self},
+    keywordstyle=\color{codered},
+    emphstyle=\color{codepurple},    % Custom highlighting style
+    stringstyle=\color{codegreen},
+    frame=tb,                         % Any extra options here
+    showstringspaces=false            % 
+}
+
+\lstset{style=pystyle}
 
 \usepackage{fontspec}
 \usepackage{pgfplots}
@@ -48,7 +62,7 @@ Most research into Garbage Collection focuses on the process in isolation.  This
 
 Oftentimes in environments like this, the Garbage Collector will disturb pages during collection by writing to them.  When doing a Mark-and-Sweep operation, the Garbage Collector traverses the entire object-space and marks the objects which are live.  This marking disturbs the page regardless of whether any objects within it are actually garbage.  While Garbage Collection has the intention of reducing the number of pages used by a process, by disturbing shared pages in forked workers, the Garbage Collector ends up increasing memory usage in the group as a whole \cite{dismissing_garbage}.  
 
-This paper examines an optimization in PyPy's Generational Garbage Collector\cite{pypy-doc} which is designed to reduce the number of shared pages that get disturbed during a major collection.  To accomplish this, we take the Garbage Collector state which was previously stored within each object and we move that state into a dense index stored in its own page in memory.  This prevents the Garbage Collector from needing to write to shared memory during collection.  
+This paper examines an optimization in PyPy's Generational Garbage Collector\cite{pypy-doc} which is designed to reduce the number of shared pages that get disturbed during a major collection.  To accomplish this, we take the Garbage Collector state which was previously stored within each object and we move that state into a dense index stored in its own page in memory.  This prevents the Garbage Collector from needing to write to shared memory during collection.  We then provide experimental evidence showing that this optimization does in fact reduce memory usage of a group of processes.  
 
 Section \ref{sec:background} explains various topics relating to the optimization and builds up to a demonstration intended to create some intuition into how this optimization is designed to work.  Section \ref{sec:design} explains the details of the optimization and builds intuition as to which data structures need to be changed.  Section \ref{sec:implementation} summarizes the source changes made to PyPy's Garbage Collector in order to implement this.  Section \ref{sec:method} talks about how these changes were tested and section \ref{sec:analysis} examines the results of these tests and explains them.  Finally, section \ref{sec:relatedwork} talks about other optimizations that have been made to Garbage Collectors to optimize for Copy-On-write behavior and explains how they differ from this research.  
 
@@ -120,6 +134,8 @@ To implement this change, we added a member variable to the MiniMarkGC class of 
 
 The following code snippet was added to MiniMarkGC and demonstrates the new interface for determining an object's visited state.
 
+\noindent
+\begin{minipage}{\linewidth}
 \begin{lstlisting}[language=python]
 def obj_visited(self, obj):
   return (
@@ -133,6 +149,7 @@ def unmark_obj_visited(self, obj):
   self.visited_objs.setitem(obj,
         llmemory.NULL)
 \end{lstlisting}
+\end{minipage}
 
 We treat $visited\_objs$ like a set.  At the start of collection, $visited\_objs$ is initialized to be an empty set.  During the Mark phase, objects are inserted into this set.  During the sweep phase, the entire object-space is scanned again.  When objects are traversed, they are either collected if they were not visited during the Mark phase or are unmarked if they were visited in the Mark phase.  Afterwards, if running in debug mode, PyPy traverses the entire object-space a third time to ensure consistency.  In a clasic MSGC, the third pass is unnecessary, but PyPy does it to simplify development.  
 
@@ -153,6 +170,8 @@ In order to replicate this environment, we created a docker image that had Ngnx,
 
 Because Instagram is closed-source, proprietary software, we were unable to procure its source code for use in testing.  Instead we created a Django application which was created specifically to emulate a production web-server load.  Specifically, we created a Django application which allocates a large chunk of memory at startup and which allocates an additional chunk of memory for each request.  Below are the snippets of code used to create test-garbage:
 
+\noindent
+\begin{minipage}{\linewidth}
 \begin{lstlisting}[language=python]
 class LargeObject():
   # Use a bunch of memory
@@ -160,9 +179,9 @@ class LargeObject():
     self.lists = []
     self.strs = []
     for i in range(1600):
-      self.lists.append(['text'] * i)
+      self.lists.append(["text"] * i)
       for j in range(40):
-        self.strs.append('str' * 8)
+        self.strs.append("str" * 8)
 
 def on_startup():
   global static_memory
@@ -176,6 +195,7 @@ def on_page_load():
   glob_a, glob_b, glob_c = (
     LargeObject(), glob_a, glob_b)
 \end{lstlisting}
+\end{minipage}
 
 We believe that this mix of memory allocation somewhat approximates what might be seen in a production web-server.  
 
@@ -185,7 +205,7 @@ To generate a test load we used httperf which makes a series of http requests to
 
 To determine the time to handle $N$ requests, we use the httperf tool to make $N$ requests and record the wall-time it took for all requests to get a response.  We run this experiment with $N$ values of 5k, 10k, 15k, and 20k.  
 
-To track memory usage as the number of requests increases, we make a burst of 100 requests and then check the memory usage of each uWSGI worker process.  We repeat this process until we've made 50 bursts of requests or 5000 requests in total.  At each step we check memory usage by scraping that process's $/proc/PID/smaps$ file.  The private memory used by that process is the sum of all lines starting with ``Private\_clean'' and ``Private\_dirty'' and the public memory used by that process is the sum of all lines starting with ``Public\_clean'' and ``Public\_dirty''.  
+To track memory usage as the number of requests increases, we make a burst of 100 requests and then check the memory usage of each uWSGI worker process.  We repeat this process until we've made 50 bursts of requests or 5000 requests in total.  At each step we check memory usage by scraping that process's $/proc/PID/smaps$ file.  The private memory used by that process is the sum of all lines starting with ``Private\_clean'' and ``Private\_dirty'' and the shared memory used by that process is the sum of all lines starting with ``Shared\_clean'' and ``Shared\_dirty''.  
 
 \section{Analysis}\label{sec:analysis}
 
